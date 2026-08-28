@@ -127,12 +127,12 @@ class OnlineQuantizationConfig(QuantizationConfig):
             "quantization='fp8_per_tensor'/'fp8_per_block' instead."
         )
 
-    def _dispatch(
+    def _get_method_cls(
         self,
         spec: QuantSpec | None,
         table: dict[QuantKey, type],
         layer: torch.nn.Module,
-    ) -> "QuantizeMethodBase | None":
+    ) -> type | None:
         if spec is None or spec.weight is None:
             return None
         cls = table.get(spec.weight)
@@ -150,33 +150,52 @@ class OnlineQuantizationConfig(QuantizationConfig):
                 f"activation override (activation={spec.activation}) is not "
                 f"yet supported for online {cls.__name__}"
             )
-        if isinstance(layer, RoutedExperts):
-            return cls(layer=layer)
-        return cls()
+        return cls
+
+    def get_quantization_target(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> tuple[str, QuantSpec, type] | None:
+        """Return the online method class for this layer without instantiating.
+
+        Used by QuantizationConfig.get_effective_quant_method. None means
+        keep the checkpoint method. `quantization_config.ignore` is honored
+        here (compressed-tensors `re:` / exact match).
+        """
+        if isinstance(layer, LinearBase):
+            source = "linear"
+            spec = self.args.linear
+            table = _ONLINE_LINEAR_METHODS
+        elif isinstance(layer, RoutedExperts):
+            source = "moe"
+            spec = self.args.moe
+            table = _ONLINE_MOE_METHODS
+        else:
+            return None
+
+        if should_ignore_layer(
+            prefix,
+            ignore=self.ignored_layers,
+            fused_mapping=self.packed_modules_mapping,
+        ):
+            return None
+
+        cls = self._get_method_cls(spec, table, layer)
+        if cls is None:
+            return None
+        assert spec is not None
+        return source, spec, cls
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
+        target = self.get_quantization_target(layer, prefix)
+        if target is not None:
+            cls = target[2]
+            if isinstance(layer, RoutedExperts):
+                return cls(layer=layer)
+            return cls()
         if isinstance(layer, LinearBase):
-            if should_ignore_layer(
-                prefix,
-                ignore=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
-            ):
-                return UnquantizedLinearMethod()
-            method = self._dispatch(self.args.linear, _ONLINE_LINEAR_METHODS, layer)
-            return method if method is not None else UnquantizedLinearMethod()
-        elif isinstance(layer, RoutedExperts):
-            if should_ignore_layer(
-                prefix,
-                ignore=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
-            ):
-                return UnquantizedFusedMoEMethod(layer.moe_config)
-            method = self._dispatch(self.args.moe, _ONLINE_MOE_METHODS, layer)
-            return (
-                method
-                if method is not None
-                else UnquantizedFusedMoEMethod(layer.moe_config)
-            )
+            return UnquantizedLinearMethod()
+        if isinstance(layer, RoutedExperts):
+            return UnquantizedFusedMoEMethod(layer.moe_config)
         return None
